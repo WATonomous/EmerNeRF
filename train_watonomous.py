@@ -609,26 +609,11 @@ def main(args):
 
         dataset = NuScenesDataset(data_cfg=cfg.data)
 
-    # To give us a quick preview of the scene, we render a data video
-    if args.render_data_video or args.render_data_video_only:
-        save_pth = os.path.join(cfg.log_dir, "data.mp4")
-        # define a `render_data_videos` per dataset.
-        dataset.render_data_videos(save_pth=save_pth, split="full")
-        if args.render_data_video_only:
-            logger.info("Render data video only, exiting...")
-            exit()
-
     # ------ build proposal networks and models -------- #
     # we input the dataset to the model builder to set some hyper-parameters
-    (
-        proposal_estimator,
-        proposal_networks,
-    ) = builders.build_estimator_and_propnet_from_cfg(
-        nerf_cfg=cfg.nerf, optim_cfg=cfg.optim, dataset=dataset, device=device
-    )
-    model = builders.build_model_from_cfg(
-        cfg=cfg.nerf.model, dataset=dataset, device=device
-    )
+    (proposal_estimator, proposal_networks) = builders.build_estimator_and_propnet_from_cfg(
+        nerf_cfg=cfg.nerf, optim_cfg=cfg.optim, dataset=dataset, device=device)
+    model = builders.build_model_from_cfg(cfg=cfg.nerf.model, dataset=dataset, device=device)
     logger.info(f"PropNetEstimator: {proposal_networks}")
     logger.info(f"Model: {model}")
 
@@ -639,44 +624,8 @@ def main(args):
 
     # ------ build scheduler -------- #
     scheduler = builders.build_scheduler_from_cfg(cfg=cfg.optim, optimizer=optimizer)
-
-    if cfg.resume_from is not None:
-        start_step = misc.resume_from_checkpoint(
-            ckpt_path=cfg.resume_from,
-            model=model,
-            proposal_networks=proposal_networks,
-            proposal_estimator=proposal_estimator,
-            optimizer=optimizer,
-            scheduler=scheduler,
-        )
-    else:
-        start_step = 0
-        logger.info(
-            f"Will start training for {cfg.optim.num_iters} iterations from scratch"
-        )
-
-    if args.visualize_voxel or args.eval_only:
-        if cfg.nerf.model.head.enable_flow_branch:
-            logger.info("Visualizing scene flow...")
-            visualize_scene_flow(
-                cfg=cfg,
-                model=model,
-                dataset=dataset,
-                device=device,
-            )
-        if cfg.nerf.model.head.enable_feature_head:
-            logger.info("Visualizing voxel features...")
-            visualize_voxels(
-                cfg,
-                model,
-                proposal_estimator,
-                proposal_networks,
-                dataset,
-                device=device,
-                save_html=True,
-                is_dynamic=cfg.nerf.model.head.enable_dynamic_branch,
-            )
-        logger.info("Visualization done!")
+    start_step = 0
+    logger.info(f"Starting real-time training from scratch")
 
     if args.eval_only:
         do_evaluation(
@@ -770,417 +719,441 @@ def main(args):
     epsilon_start = cfg.supervision.depth.line_of_sight.start_epsilon
     all_iters = np.arange(start_step, cfg.optim.num_iters + 1)
     line_of_sight_loss_decay_weight = 1.0
-    start_time = time.time()
-    for step in metric_logger.log_every(all_iters, cfg.logging.print_freq):
-        if start_time - time.time() > 4*60:
-            print("Reached time limit, stop training")
-            break
-        model.train()
-        proposal_estimator.train()
-        for p in proposal_networks:
-            p.train()
-        epsilon, stats, pixel_data_dict, lidar_data_dict = None, None, None, None
-        pixel_loss_dict, lidar_loss_dict = {}, {}
-
-        if (
-            step > cfg.supervision.depth.line_of_sight.start_iter
-            and (step - cfg.supervision.depth.line_of_sight.start_iter)
-            % cfg.supervision.depth.line_of_sight.decay_steps
-            == 0
-        ):
-            line_of_sight_loss_decay_weight *= (
-                cfg.supervision.depth.line_of_sight.decay_rate
-            )
-            logger.info(
-                f"line_of_sight_loss_decay_weight: {line_of_sight_loss_decay_weight}"
-            )
-
-        # ------ pixel ray supervision -------- #
-        if cfg.data.pixel_source.load_rgb:
-            proposal_requires_grad = proposal_requires_grad_fn(int(step))
-            i = torch.randint(0, len(dataset.train_pixel_set), (1,)).item()
-            pixel_data_dict = dataset.train_pixel_set[i]
-            for k, v in pixel_data_dict.items():
-                if isinstance(v, torch.Tensor):
-                    pixel_data_dict[k] = v.cuda(non_blocking=True)
-            # ------ pixel-wise supervision -------- #
-            render_results = render_rays(
-                radiance_field=model,
-                proposal_estimator=proposal_estimator,
-                proposal_networks=proposal_networks,
-                data_dict=pixel_data_dict,
+    
+    ## REAL-TIME Analysis Changes
+    FPS = 10 # For WAYMO
+    current_frame = 1 # Used to mimic real-time processing
+    current_train_set_index = 1
+    # TODO: Change to a well-defined value that corresponds to total number of frames
+    total_frames = len(dataset.train_pixel_set) + len(dataset.test_pixel_set)
+    while current_frame < total_frames:
+        if current_frame % 5 == 0:
+            do_realtime_psnr_evaluation(
+                step=current_frame, #TODO: Is this the correct value to use here?
                 cfg=cfg,
-                proposal_requires_grad=proposal_requires_grad,
-            )
-            proposal_estimator.update_every_n_steps(
-                render_results["extras"]["trans"],
-                proposal_requires_grad,
-                loss_scaler=1024,
-            )
-            # compute losses
-            # rgb loss
-            pixel_loss_dict.update(
-                rgb_loss_fn(render_results["rgb"], pixel_data_dict["pixels"])
-            )
-            if sky_loss_fn is not None:  # if sky loss is enabled
-                if cfg.supervision.sky.loss_type == "weights_based":
-                    # penalize the points' weights if they point to the sky
-                    pixel_loss_dict.update(
-                        sky_loss_fn(
-                            render_results["extras"]["weights"],
-                            pixel_data_dict["sky_masks"],
-                        )
-                    )
-                elif cfg.supervision.sky.loss_type == "opacity_based":
-                    # penalize accumulated opacity if the ray points to the sky
-                    pixel_loss_dict.update(
-                        sky_loss_fn(
-                            render_results["opacity"], pixel_data_dict["sky_masks"]
-                        )
-                    )
-                else:
-                    raise NotImplementedError(
-                        f"sky_loss_type {cfg.supervision.sky.loss_type} not implemented"
-                    )
-            if feature_loss_fn is not None:
-                pixel_loss_dict.update(
-                    feature_loss_fn(
-                        render_results["dino_feat"],
-                        pixel_data_dict["features"],
-                    )
-                )
-            if dynamic_reg_loss_fn is not None:
-                pixel_loss_dict.update(
-                    dynamic_reg_loss_fn(
-                        dynamic_density=render_results["extras"]["dynamic_density"],
-                        static_density=render_results["extras"]["static_density"],
-                    )
-                )
-            if shadow_loss_fn is not None:
-                pixel_loss_dict.update(
-                    shadow_loss_fn(
-                        render_results["shadow_ratio"],
-                    )
-                )
-            if "forward_flow" in render_results["extras"]:
-                cycle_loss = (
-                    0.5
-                    * (
-                        (
-                            render_results["extras"]["forward_flow"].detach()
-                            + render_results["extras"]["forward_pred_backward_flow"]
-                        )
-                        ** 2
-                        + (
-                            render_results["extras"]["backward_flow"].detach()
-                            + render_results["extras"]["backward_pred_forward_flow"]
-                        )
-                        ** 2
-                    ).mean()
-                )
-                pixel_loss_dict.update({"cycle_loss": cycle_loss * 0.01})
-                stats = {
-                    "max_forward_flow_norm": (
-                        render_results["extras"]["forward_flow"]
-                        .detach()
-                        .norm(dim=-1)
-                        .max()
-                    ),
-                    "max_backward_flow_norm": (
-                        render_results["extras"]["backward_flow"]
-                        .detach()
-                        .norm(dim=-1)
-                        .max()
-                    ),
-                    "max_forward_pred_backward_flow_norm": (
-                        render_results["extras"]["forward_pred_backward_flow"]
-                        .norm(dim=-1)
-                        .max()
-                    ),
-                    "max_backward_pred_forward_flow_norm": (
-                        render_results["extras"]["backward_pred_forward_flow"]
-                        .norm(dim=-1)
-                        .max()
-                    ),
-                }
-            total_pixel_loss = sum(loss for loss in pixel_loss_dict.values())
-            optimizer.zero_grad()
-            pixel_grad_scaler.scale(total_pixel_loss).backward()
-            optimizer.step()
-            scheduler.step()
-
-        # ------ lidar ray supervision -------- #
-        if cfg.data.lidar_source.load_lidar and cfg.supervision.depth.enable:
-            proposal_requires_grad = proposal_requires_grad_fn(int(step))
-            i = torch.randint(0, len(dataset.train_lidar_set), (1,)).item()
-            lidar_data_dict = dataset.train_lidar_set[i]
-            for k, v in lidar_data_dict.items():
-                if isinstance(v, torch.Tensor):
-                    lidar_data_dict[k] = v.cuda(non_blocking=True)
-            lidar_render_results = render_rays(
-                radiance_field=model,
-                proposal_estimator=proposal_estimator,
+                model=model,
                 proposal_networks=proposal_networks,
-                data_dict=lidar_data_dict,
-                cfg=cfg,
-                proposal_requires_grad=proposal_requires_grad,
-                prefix="lidar_",
+                proposal_estimator=proposal_estimator,
+                dataset=dataset,
+                args=args,
             )
-            proposal_estimator.update_every_n_steps(
-                lidar_render_results["extras"]["trans"],
-                proposal_requires_grad,
-                loss_scaler=1024,
-            )
-            lidar_loss_dict.update(
-                depth_loss_fn(
-                    lidar_render_results["depth"],
-                    lidar_data_dict["lidar_ranges"],
-                    name="lidar_range_loss",
-                )
-            )
-            if (
-                line_of_sight_loss_fn is not None
-                and step > cfg.supervision.depth.line_of_sight.start_iter
-            ):
-                m = (epsilon_final - epsilon_start) / (
-                    cfg.optim.num_iters - cfg.supervision.depth.line_of_sight.start_iter
-                )
-                b = epsilon_start - m * cfg.supervision.depth.line_of_sight.start_iter
-
-                def epsilon_decay(step):
-                    if step < cfg.supervision.depth.line_of_sight.start_iter:
-                        return epsilon_start
-                    elif step > cfg.optim.num_iters:
-                        return epsilon_final
-                    else:
-                        return m * step + b
-
-                epsilon = epsilon_decay(step)
-                line_of_sight_loss_dict = line_of_sight_loss_fn(
-                    pred_depth=lidar_render_results["depth"],
-                    gt_depth=lidar_data_dict["lidar_ranges"],
-                    weights=lidar_render_results["extras"]["weights"],
-                    t_vals=lidar_render_results["extras"]["t_vals"],
-                    epsilon=epsilon,
-                    name="lidar_line_of_sight",
-                    coef_decay=line_of_sight_loss_decay_weight,
-                )
-                lidar_loss_dict.update(
-                    {
-                        "lidar_line_of_sight": line_of_sight_loss_dict[
-                            "lidar_line_of_sight"
-                        ].mean()
-                    }
-                )
-
-            if dynamic_reg_loss_fn is not None:
-                lidar_loss_dict.update(
-                    dynamic_reg_loss_fn(
-                        dynamic_density=lidar_render_results["extras"][
-                            "dynamic_density"
-                        ],
-                        static_density=lidar_render_results["extras"]["static_density"],
-                        name="lidar_dynamic",
-                    )
-                )
-
-            total_lidar_loss = sum(loss for loss in lidar_loss_dict.values())
-            optimizer.zero_grad()
-            lidar_grad_scaler.scale(total_lidar_loss).backward()
-            optimizer.step()
-            scheduler.step()
-            total_lidar_loss = total_lidar_loss.item()
         else:
-            total_lidar_loss = -1
-
-        if pixel_data_dict is not None:
-            psnr = metrics.compute_psnr(
-                render_results["rgb"], pixel_data_dict["pixels"]
-            )
-            metric_logger.update(psnr=psnr)
-            metric_logger.update(
-                total_pixel_loss=total_pixel_loss.item(),
-            )
-
-        if lidar_data_dict is not None:
-            metric_logger.update(
-                total_lidar_loss=total_lidar_loss,
-            )
-            range_rmse = metrics.compute_valid_depth_rmse(
-                lidar_render_results["depth"], lidar_data_dict["lidar_ranges"]
-            )
-            metric_logger.update(range_rmse=range_rmse)
-
-        metric_logger.update(**{k: v.item() for k, v in pixel_loss_dict.items()})
-        metric_logger.update(**{k: v.item() for k, v in lidar_loss_dict.items()})
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        if stats is not None:
-            metric_logger.update(**{k: v.item() for k, v in stats.items()})
-        if epsilon is not None:
-            metric_logger.update(epsilon=epsilon)
-        # log to wandb
-        if args.enable_wandb:
-            wandb.log(
-                {f"train_stats/{k}": v.avg for k, v in metric_logger.meters.items()}
-            )
-
-        if step > 0 and (
-            ((step % cfg.logging.saveckpt_freq == 0) or (step == cfg.optim.num_iters))
-            and (cfg.resume_from is None)
-        ):
-            checkpoint = {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "proposal_networks": [p.state_dict() for p in proposal_networks],
-                "estimator.optimizer": proposal_estimator.optimizer.state_dict(),
-                "estimator.scheduler": proposal_estimator.scheduler.state_dict(),
-                "step": step,
-            }
-            save_pth = os.path.join(cfg.log_dir, f"checkpoint_{step:05d}.pth")
-            torch.save(checkpoint, save_pth)
-            logger.info(f"Saved a checkpoint to {save_pth}")
-
-        if (
-            step > 0
-            and cfg.data.pixel_source.load_rgb
-            and step % cfg.optim.cache_rgb_freq == 0
-        ):
-            model.eval()
-            proposal_estimator.eval()
+            current_train_set_index += 1
+        train_pass_start_time = time.time()
+        for step in metric_logger.log_every(all_iters, cfg.logging.print_freq):
+            if time.time() - train_pass_start_time > 1/FPS:
+                break
+            model.train()
+            proposal_estimator.train()
             for p in proposal_networks:
-                p.eval()
-            if cfg.data.pixel_source.sampler.buffer_ratio > 0:
-                with torch.no_grad():
-                    logger.info("cache rgb error map...")
-                    dataset.pixel_source.update_downscale_factor(
-                        1 / cfg.data.pixel_source.sampler.buffer_downscale
-                    )
-                    render_results = render_pixels(
-                        cfg=cfg,
-                        model=model,
-                        proposal_networks=proposal_networks,
-                        proposal_estimator=proposal_estimator,
-                        dataset=dataset.full_pixel_set,
-                        compute_metrics=False,
-                        return_decomposition=True,
-                    )
-                    dataset.pixel_source.reset_downscale_factor()
-                    dataset.pixel_source.update_pixel_error_maps(render_results)
-                    maps_video = dataset.pixel_source.get_pixel_sample_weights_video()
-                    merged_list = []
-                    for i in range(len(maps_video) // dataset.pixel_source.num_cams):
-                        frames = maps_video[
-                            i
-                            * dataset.pixel_source.num_cams : (i + 1)
-                            * dataset.pixel_source.num_cams
-                        ]
-                        frames = [
-                            np.stack([frame, frame, frame], axis=-1) for frame in frames
-                        ]
-                        frames = np.concatenate(frames, axis=1)
-                        merged_list.append(frames)
-                    merged_video = np.stack(merged_list, axis=0)
-                    merged_video -= merged_video.min()
-                    merged_video /= merged_video.max()
-                    merged_video = np.clip(merged_video * 255, 0, 255).astype(np.uint8)
+                p.train()
+            epsilon, stats, pixel_data_dict, lidar_data_dict = None, None, None, None
+            pixel_loss_dict, lidar_loss_dict = {}, {}
 
-                    imageio.mimsave(
-                        os.path.join(
-                            cfg.log_dir, "buffer_maps", f"buffer_maps_{step}.mp4"
-                        ),
-                        merged_video,
-                        fps=cfg.render.fps,
-                    )
-                logger.info("Done caching rgb error maps")
+            if (
+                step > cfg.supervision.depth.line_of_sight.start_iter
+                and (step - cfg.supervision.depth.line_of_sight.start_iter)
+                % cfg.supervision.depth.line_of_sight.decay_steps
+                == 0
+            ):
+                line_of_sight_loss_decay_weight *= (
+                    cfg.supervision.depth.line_of_sight.decay_rate
+                )
+                logger.info(
+                    f"line_of_sight_loss_decay_weight: {line_of_sight_loss_decay_weight}"
+                )
 
-        if step > 0 and step % cfg.logging.vis_freq == 0:
-            model.eval()
-            proposal_estimator.eval()
-            for p in proposal_networks:
-                p.eval()
+            # ------ pixel ray supervision -------- #
             if cfg.data.pixel_source.load_rgb:
-                logger.info("Visualizing...")
-                vis_timestep = np.linspace(
-                    0,
-                    dataset.num_img_timesteps,
-                    cfg.optim.num_iters // cfg.logging.vis_freq + 1,
-                    endpoint=False,
-                    dtype=int,
-                )[step // cfg.logging.vis_freq]
-                with torch.no_grad():
-                    render_results = render_pixels(
-                        cfg=cfg,
-                        model=model,
-                        proposal_networks=proposal_networks,
-                        proposal_estimator=proposal_estimator,
-                        dataset=dataset.full_pixel_set,
-                        compute_metrics=True,
-                        vis_indices=[
-                            vis_timestep * dataset.pixel_source.num_cams + i
-                            for i in range(dataset.pixel_source.num_cams)
-                        ],
-                        return_decomposition=True,
+                proposal_requires_grad = proposal_requires_grad_fn(int(step))
+                # current_train_set_index stops us from using frames we haven't yet seen in real-time
+                i = torch.randint(0, len(dataset.train_pixel_set[:current_train_set_index]), (1,)).item()
+                pixel_data_dict = dataset.train_pixel_set[i]
+                for k, v in pixel_data_dict.items():
+                    if isinstance(v, torch.Tensor):
+                        pixel_data_dict[k] = v.cuda(non_blocking=True)
+                # ------ pixel-wise supervision -------- #
+                render_results = render_rays(
+                    radiance_field=model,
+                    proposal_estimator=proposal_estimator,
+                    proposal_networks=proposal_networks,
+                    data_dict=pixel_data_dict,
+                    cfg=cfg,
+                    proposal_requires_grad=proposal_requires_grad,
+                )
+                proposal_estimator.update_every_n_steps(
+                    render_results["extras"]["trans"],
+                    proposal_requires_grad,
+                    loss_scaler=1024,
+                )
+                # compute losses
+                # rgb loss
+                pixel_loss_dict.update(
+                    rgb_loss_fn(render_results["rgb"], pixel_data_dict["pixels"])
+                )
+                if sky_loss_fn is not None:  # if sky loss is enabled
+                    if cfg.supervision.sky.loss_type == "weights_based":
+                        # penalize the points' weights if they point to the sky
+                        pixel_loss_dict.update(
+                            sky_loss_fn(
+                                render_results["extras"]["weights"],
+                                pixel_data_dict["sky_masks"],
+                            )
+                        )
+                    elif cfg.supervision.sky.loss_type == "opacity_based":
+                        # penalize accumulated opacity if the ray points to the sky
+                        pixel_loss_dict.update(
+                            sky_loss_fn(
+                                render_results["opacity"], pixel_data_dict["sky_masks"]
+                            )
+                        )
+                    else:
+                        raise NotImplementedError(
+                            f"sky_loss_type {cfg.supervision.sky.loss_type} not implemented"
+                        )
+                if feature_loss_fn is not None:
+                    pixel_loss_dict.update(
+                        feature_loss_fn(
+                            render_results["dino_feat"],
+                            pixel_data_dict["features"],
+                        )
                     )
-                if args.enable_wandb:
-                    wandb.log(
+                if dynamic_reg_loss_fn is not None:
+                    pixel_loss_dict.update(
+                        dynamic_reg_loss_fn(
+                            dynamic_density=render_results["extras"]["dynamic_density"],
+                            static_density=render_results["extras"]["static_density"],
+                        )
+                    )
+                if shadow_loss_fn is not None:
+                    pixel_loss_dict.update(
+                        shadow_loss_fn(
+                            render_results["shadow_ratio"],
+                        )
+                    )
+                if "forward_flow" in render_results["extras"]:
+                    cycle_loss = (
+                        0.5
+                        * (
+                            (
+                                render_results["extras"]["forward_flow"].detach()
+                                + render_results["extras"]["forward_pred_backward_flow"]
+                            )
+                            ** 2
+                            + (
+                                render_results["extras"]["backward_flow"].detach()
+                                + render_results["extras"]["backward_pred_forward_flow"]
+                            )
+                            ** 2
+                        ).mean()
+                    )
+                    pixel_loss_dict.update({"cycle_loss": cycle_loss * 0.01})
+                    stats = {
+                        "max_forward_flow_norm": (
+                            render_results["extras"]["forward_flow"]
+                            .detach()
+                            .norm(dim=-1)
+                            .max()
+                        ),
+                        "max_backward_flow_norm": (
+                            render_results["extras"]["backward_flow"]
+                            .detach()
+                            .norm(dim=-1)
+                            .max()
+                        ),
+                        "max_forward_pred_backward_flow_norm": (
+                            render_results["extras"]["forward_pred_backward_flow"]
+                            .norm(dim=-1)
+                            .max()
+                        ),
+                        "max_backward_pred_forward_flow_norm": (
+                            render_results["extras"]["backward_pred_forward_flow"]
+                            .norm(dim=-1)
+                            .max()
+                        ),
+                    }
+                total_pixel_loss = sum(loss for loss in pixel_loss_dict.values())
+                optimizer.zero_grad()
+                pixel_grad_scaler.scale(total_pixel_loss).backward()
+                optimizer.step()
+                scheduler.step()
+
+            # ------ lidar ray supervision -------- #
+            if cfg.data.lidar_source.load_lidar and cfg.supervision.depth.enable:
+                proposal_requires_grad = proposal_requires_grad_fn(int(step))
+                i = torch.randint(0, len(dataset.train_lidar_set), (1,)).item()
+                lidar_data_dict = dataset.train_lidar_set[i]
+                for k, v in lidar_data_dict.items():
+                    if isinstance(v, torch.Tensor):
+                        lidar_data_dict[k] = v.cuda(non_blocking=True)
+                lidar_render_results = render_rays(
+                    radiance_field=model,
+                    proposal_estimator=proposal_estimator,
+                    proposal_networks=proposal_networks,
+                    data_dict=lidar_data_dict,
+                    cfg=cfg,
+                    proposal_requires_grad=proposal_requires_grad,
+                    prefix="lidar_",
+                )
+                proposal_estimator.update_every_n_steps(
+                    lidar_render_results["extras"]["trans"],
+                    proposal_requires_grad,
+                    loss_scaler=1024,
+                )
+                lidar_loss_dict.update(
+                    depth_loss_fn(
+                        lidar_render_results["depth"],
+                        lidar_data_dict["lidar_ranges"],
+                        name="lidar_range_loss",
+                    )
+                )
+                if (
+                    line_of_sight_loss_fn is not None
+                    and step > cfg.supervision.depth.line_of_sight.start_iter
+                ):
+                    m = (epsilon_final - epsilon_start) / (
+                        cfg.optim.num_iters - cfg.supervision.depth.line_of_sight.start_iter
+                    )
+                    b = epsilon_start - m * cfg.supervision.depth.line_of_sight.start_iter
+
+                    def epsilon_decay(step):
+                        if step < cfg.supervision.depth.line_of_sight.start_iter:
+                            return epsilon_start
+                        elif step > cfg.optim.num_iters:
+                            return epsilon_final
+                        else:
+                            return m * step + b
+
+                    epsilon = epsilon_decay(step)
+                    line_of_sight_loss_dict = line_of_sight_loss_fn(
+                        pred_depth=lidar_render_results["depth"],
+                        gt_depth=lidar_data_dict["lidar_ranges"],
+                        weights=lidar_render_results["extras"]["weights"],
+                        t_vals=lidar_render_results["extras"]["t_vals"],
+                        epsilon=epsilon,
+                        name="lidar_line_of_sight",
+                        coef_decay=line_of_sight_loss_decay_weight,
+                    )
+                    lidar_loss_dict.update(
                         {
-                            "pixel_metrics/psnr": render_results["psnr"],
-                            "pixel_metrics/ssim": render_results["ssim"],
-                            "pixel_metrics/feat_psnr": render_results["feat_psnr"],
-                            "pixel_metrics/masked_psnr": render_results["masked_psnr"],
-                            "pixel_metrics/masked_ssim": render_results["masked_ssim"],
-                            "pixel_metrics/masked_feat_psnr": render_results[
-                                "masked_feat_psnr"
-                            ],
+                            "lidar_line_of_sight": line_of_sight_loss_dict[
+                                "lidar_line_of_sight"
+                            ].mean()
                         }
                     )
-                vis_frame_dict = save_videos(
-                    render_results,
-                    save_pth=os.path.join(
-                        cfg.log_dir, "images", f"step_{step}.png"
-                    ),  # don't save the video
-                    num_timestamps=1,
-                    keys=render_keys,
-                    save_seperate_video=cfg.logging.save_seperate_video,
-                    num_cams=dataset.pixel_source.num_cams,
-                    fps=cfg.render.fps,
-                    verbose=False,
+
+                if dynamic_reg_loss_fn is not None:
+                    lidar_loss_dict.update(
+                        dynamic_reg_loss_fn(
+                            dynamic_density=lidar_render_results["extras"][
+                                "dynamic_density"
+                            ],
+                            static_density=lidar_render_results["extras"]["static_density"],
+                            name="lidar_dynamic",
+                        )
+                    )
+
+                total_lidar_loss = sum(loss for loss in lidar_loss_dict.values())
+                optimizer.zero_grad()
+                lidar_grad_scaler.scale(total_lidar_loss).backward()
+                optimizer.step()
+                scheduler.step()
+                total_lidar_loss = total_lidar_loss.item()
+            else:
+                total_lidar_loss = -1
+
+            if pixel_data_dict is not None:
+                psnr = metrics.compute_psnr(
+                    render_results["rgb"], pixel_data_dict["pixels"]
                 )
-                if args.enable_wandb:
-                    for k, v in vis_frame_dict.items():
-                        wandb.log({"pixel_rendering/" + k: wandb.Image(v)})
+                metric_logger.update(psnr=psnr)
+                metric_logger.update(
+                    total_pixel_loss=total_pixel_loss.item(),
+                )
+
+            if lidar_data_dict is not None:
+                metric_logger.update(
+                    total_lidar_loss=total_lidar_loss,
+                )
+                range_rmse = metrics.compute_valid_depth_rmse(
+                    lidar_render_results["depth"], lidar_data_dict["lidar_ranges"]
+                )
+                metric_logger.update(range_rmse=range_rmse)
+
+            metric_logger.update(**{k: v.item() for k, v in pixel_loss_dict.items()})
+            metric_logger.update(**{k: v.item() for k, v in lidar_loss_dict.items()})
+            metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+            if stats is not None:
+                metric_logger.update(**{k: v.item() for k, v in stats.items()})
+            if epsilon is not None:
+                metric_logger.update(epsilon=epsilon)
+            # log to wandb
+            if args.enable_wandb:
+                wandb.log(
+                    {f"train_stats/{k}": v.avg for k, v in metric_logger.meters.items()}
+                )
+
+            if step > 0 and (
+                ((step % cfg.logging.saveckpt_freq == 0) or (step == cfg.optim.num_iters))
+                and (cfg.resume_from is None)
+            ):
+                checkpoint = {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "proposal_networks": [p.state_dict() for p in proposal_networks],
+                    "estimator.optimizer": proposal_estimator.optimizer.state_dict(),
+                    "estimator.scheduler": proposal_estimator.scheduler.state_dict(),
+                    "step": step,
+                }
+                save_pth = os.path.join(cfg.log_dir, f"checkpoint_{step:05d}.pth")
+                torch.save(checkpoint, save_pth)
+                logger.info(f"Saved a checkpoint to {save_pth}")
+
+            if (
+                step > 0
+                and cfg.data.pixel_source.load_rgb
+                and step % cfg.optim.cache_rgb_freq == 0
+            ):
+                model.eval()
+                proposal_estimator.eval()
+                for p in proposal_networks:
+                    p.eval()
                 if cfg.data.pixel_source.sampler.buffer_ratio > 0:
-                    vis_frame = dataset.pixel_source.visualize_pixel_sample_weights(
-                        [
-                            vis_timestep * dataset.pixel_source.num_cams + i
-                            for i in range(dataset.pixel_source.num_cams)
-                        ]
-                    )
-                    imageio.imwrite(
-                        os.path.join(
-                            cfg.log_dir, "buffer_maps", f"buffer_map_{step}.png"
-                        ),
-                        vis_frame,
-                    )
+                    with torch.no_grad():
+                        logger.info("cache rgb error map...")
+                        dataset.pixel_source.update_downscale_factor(
+                            1 / cfg.data.pixel_source.sampler.buffer_downscale
+                        )
+                        render_results = render_pixels(
+                            cfg=cfg,
+                            model=model,
+                            proposal_networks=proposal_networks,
+                            proposal_estimator=proposal_estimator,
+                            dataset=dataset.full_pixel_set,
+                            compute_metrics=False,
+                            return_decomposition=True,
+                        )
+                        dataset.pixel_source.reset_downscale_factor()
+                        dataset.pixel_source.update_pixel_error_maps(render_results)
+                        maps_video = dataset.pixel_source.get_pixel_sample_weights_video()
+                        merged_list = []
+                        for i in range(len(maps_video) // dataset.pixel_source.num_cams):
+                            frames = maps_video[
+                                i
+                                * dataset.pixel_source.num_cams : (i + 1)
+                                * dataset.pixel_source.num_cams
+                            ]
+                            frames = [
+                                np.stack([frame, frame, frame], axis=-1) for frame in frames
+                            ]
+                            frames = np.concatenate(frames, axis=1)
+                            merged_list.append(frames)
+                        merged_video = np.stack(merged_list, axis=0)
+                        merged_video -= merged_video.min()
+                        merged_video /= merged_video.max()
+                        merged_video = np.clip(merged_video * 255, 0, 255).astype(np.uint8)
+
+                        imageio.mimsave(
+                            os.path.join(
+                                cfg.log_dir, "buffer_maps", f"buffer_maps_{step}.mp4"
+                            ),
+                            merged_video,
+                            fps=cfg.render.fps,
+                        )
+                    logger.info("Done caching rgb error maps")
+
+            if step > 0 and step % cfg.logging.vis_freq == 0:
+                model.eval()
+                proposal_estimator.eval()
+                for p in proposal_networks:
+                    p.eval()
+                if cfg.data.pixel_source.load_rgb:
+                    logger.info("Visualizing...")
+                    vis_timestep = np.linspace(
+                        0,
+                        dataset.num_img_timesteps,
+                        cfg.optim.num_iters // cfg.logging.vis_freq + 1,
+                        endpoint=False,
+                        dtype=int,
+                    )[step // cfg.logging.vis_freq]
+                    with torch.no_grad():
+                        render_results = render_pixels(
+                            cfg=cfg,
+                            model=model,
+                            proposal_networks=proposal_networks,
+                            proposal_estimator=proposal_estimator,
+                            dataset=dataset.full_pixel_set,
+                            compute_metrics=True,
+                            vis_indices=[
+                                vis_timestep * dataset.pixel_source.num_cams + i
+                                for i in range(dataset.pixel_source.num_cams)
+                            ],
+                            return_decomposition=True,
+                        )
                     if args.enable_wandb:
                         wandb.log(
-                            {"pixel_rendering/buffer_map": wandb.Image(vis_frame)}
+                            {
+                                "pixel_metrics/psnr": render_results["psnr"],
+                                "pixel_metrics/ssim": render_results["ssim"],
+                                "pixel_metrics/feat_psnr": render_results["feat_psnr"],
+                                "pixel_metrics/masked_psnr": render_results["masked_psnr"],
+                                "pixel_metrics/masked_ssim": render_results["masked_ssim"],
+                                "pixel_metrics/masked_feat_psnr": render_results[
+                                    "masked_feat_psnr"
+                                ],
+                            }
                         )
-                del render_results
-                torch.cuda.empty_cache()
-
+                    vis_frame_dict = save_videos(
+                        render_results,
+                        save_pth=os.path.join(
+                            cfg.log_dir, "images", f"step_{step}.png"
+                        ),  # don't save the video
+                        num_timestamps=1,
+                        keys=render_keys,
+                        save_seperate_video=cfg.logging.save_seperate_video,
+                        num_cams=dataset.pixel_source.num_cams,
+                        fps=cfg.render.fps,
+                        verbose=False,
+                    )
+                    if args.enable_wandb:
+                        for k, v in vis_frame_dict.items():
+                            wandb.log({"pixel_rendering/" + k: wandb.Image(v)})
+                    if cfg.data.pixel_source.sampler.buffer_ratio > 0:
+                        vis_frame = dataset.pixel_source.visualize_pixel_sample_weights(
+                            [
+                                vis_timestep * dataset.pixel_source.num_cams + i
+                                for i in range(dataset.pixel_source.num_cams)
+                            ]
+                        )
+                        imageio.imwrite(
+                            os.path.join(
+                                cfg.log_dir, "buffer_maps", f"buffer_map_{step}.png"
+                            ),
+                            vis_frame,
+                        )
+                        if args.enable_wandb:
+                            wandb.log(
+                                {"pixel_rendering/buffer_map": wandb.Image(vis_frame)}
+                            )
+                    del render_results
+                    torch.cuda.empty_cache()
+        
+        # Increment current frame
+        current_frame += 1
+            
     logger.info("Training done!")
 
-    do_evaluation(
-        step=step,
-        cfg=cfg,
-        model=model,
-        proposal_networks=proposal_networks,
-        proposal_estimator=proposal_estimator,
-        dataset=dataset,
-        args=args,
-    )
+
+    # do_evaluation(
+    #     step=step,
+    #     cfg=cfg,
+    #     model=model,
+    #     proposal_networks=proposal_networks,
+    #     proposal_estimator=proposal_estimator,
+    #     dataset=dataset,
+    #     args=args,
+    # )
     if cfg.data.pixel_source.delete_features_after_run:
         dataset.pixel_source.delete_features()
     if args.enable_wandb:
